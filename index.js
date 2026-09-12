@@ -65,8 +65,36 @@ const DEFAULT_DATA = {
     adminRoleId: null,
     developerRoleId: null,
     ticketCategoryId: null,
+    // customizable panel embed (edit via /bug embed)
+    panelEmbed: {
+      title: 'Tickets Report Bug Bot',
+      description: 'กดปุ่มด้านล่างเพื่อรายงานบัคที่เกิดขึ้น ( กดเล่นโดน Blacklist )',
+      color: 0x5865f2,
+      image: null,
+      footer: null,
+    },
   },
 };
+
+// Deep-merge helper so that older/partial data.json files (saved before new
+// config fields existed) don't wipe out newly-added defaults. A plain
+// Object.assign only merges top-level keys, so nested objects like
+// `config` or `config.panelEmbed` would otherwise be replaced wholesale
+// and lose any new sub-fields, causing "Cannot read properties of
+// undefined" crashes after an update.
+function deepMerge(base, override) {
+  if (Array.isArray(base)) return Array.isArray(override) ? override : base;
+  if (base && typeof base === 'object') {
+    const out = { ...base };
+    if (override && typeof override === 'object') {
+      for (const key of Object.keys(override)) {
+        out[key] = deepMerge(base[key], override[key]);
+      }
+    }
+    return out;
+  }
+  return override === undefined ? base : override;
+}
 
 function loadData() {
   try {
@@ -76,7 +104,7 @@ function loadData() {
     }
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    return Object.assign(JSON.parse(JSON.stringify(DEFAULT_DATA)), parsed);
+    return deepMerge(JSON.parse(JSON.stringify(DEFAULT_DATA)), parsed);
   } catch (err) {
     console.error('[storage] failed to load data.json, using defaults:', err.message);
     return JSON.parse(JSON.stringify(DEFAULT_DATA));
@@ -201,6 +229,21 @@ function jaccardSimilarity(a, b) {
   return union === 0 ? 0 : intersection / union;
 }
 
+function parseHexColor(str) {
+  const cleaned = String(str).trim().replace(/^#/, '');
+  if (!/^[0-9a-fA-F]{6}$/.test(cleaned)) return null;
+  return parseInt(cleaned, 16);
+}
+
+function isValidUrl(str) {
+  try {
+    const u = new URL(str);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function isBlacklisted(userId) {
   return data.blacklist.includes(userId);
 }
@@ -279,10 +322,14 @@ async function safeReply(interaction, options) {
    ============================================================ */
 
 function buildPanelEmbed() {
-  return new EmbedBuilder()
-    .setTitle('Tickets Report Bug Bot')
-    .setDescription('กดปุ่มด้านล่างเพื่อรายงานบัคที่เกิดขึ่น ( กดเล่นโดน Backlist )')
-    .setColor(0x5865f2);
+  const cfg = data.config.panelEmbed || DEFAULT_DATA.config.panelEmbed;
+  const embed = new EmbedBuilder()
+    .setTitle(cfg.title || DEFAULT_DATA.config.panelEmbed.title)
+    .setDescription(cfg.description || DEFAULT_DATA.config.panelEmbed.description)
+    .setColor(typeof cfg.color === 'number' ? cfg.color : DEFAULT_DATA.config.panelEmbed.color);
+  if (cfg.image) embed.setImage(cfg.image);
+  if (cfg.footer) embed.setFooter({ text: cfg.footer });
+  return embed;
 }
 
 function buildPanelRow() {
@@ -405,6 +452,21 @@ const commands = [
             .setRequired(true)
         )
     )
+    .addSubcommand((sub) =>
+      sub
+        .setName('embed')
+        .setDescription('Customize the report panel embed (title/description/image/footer/color)')
+        .addStringOption((opt) => opt.setName('title').setDescription('Embed title').setMaxLength(256))
+        .addStringOption((opt) => opt.setName('description').setDescription('Embed description').setMaxLength(4000))
+        .addStringOption((opt) => opt.setName('color').setDescription('Hex color, e.g. #5865F2'))
+        .addStringOption((opt) =>
+          opt.setName('image').setDescription('Image URL (use "none" to remove)')
+        )
+        .addStringOption((opt) =>
+          opt.setName('footer').setDescription('Footer text (use "none" to remove)').setMaxLength(2048)
+        )
+        .addBooleanOption((opt) => opt.setName('reset').setDescription('Reset the panel embed to default'))
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .toJSON(),
 ];
@@ -456,7 +518,8 @@ async function runEscalationCheck() {
       if (bug.severity !== 'critical') continue;
       if (TERMINAL_STATUSES.includes(bug.status)) continue;
       if (bug.escalated) continue;
-      if (now - bug.createdAt >= CRITICAL_ESCALATION) {
+      const since = bug.criticalSince || bug.createdAt;
+      if (now - since >= CRITICAL_ESCALATION) {
         bug.escalated = true;
         saveData();
         await sendEscalationAlert(bug);
@@ -478,7 +541,7 @@ async function sendEscalationAlert(bug) {
       .addFields(
         { name: 'Title', value: bug.title.slice(0, 1024) },
         { name: 'Status', value: statusText(bug.status), inline: true },
-        { name: 'Elapsed', value: formatDuration(Date.now() - bug.createdAt), inline: true }
+        { name: 'Elapsed', value: formatDuration(Date.now() - (bug.criticalSince || bug.createdAt)), inline: true }
       )
       .setColor(0xed4245);
     await channel.send({ content: bug.channelId ? `<#${bug.channelId}>` : undefined, embeds: [embed] });
@@ -671,6 +734,75 @@ async function handleSlashCommand(interaction) {
     saveData();
     return safeReply(interaction, { content: `✅ ตั้งค่า Ticket Category เป็น **${category.name}** แล้ว`, ephemeral: true });
   }
+
+  if (sub === 'embed') {
+    if (!isAdmin(interaction.member)) {
+      return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
+    }
+
+    const reset = interaction.options.getBoolean('reset');
+    if (reset) {
+      data.config.panelEmbed = { ...DEFAULT_DATA.config.panelEmbed };
+      saveData();
+      return safeReply(interaction, {
+        content: '✅ รีเซ็ต Panel Embed กลับเป็นค่าเริ่มต้นแล้ว ใช้ `/bug panel` เพื่อโพสต์ใหม่',
+        embeds: [buildPanelEmbed()],
+        ephemeral: true,
+      });
+    }
+
+    const titleOpt = interaction.options.getString('title');
+    const descOpt = interaction.options.getString('description');
+    const colorOpt = interaction.options.getString('color');
+    const imageOpt = interaction.options.getString('image');
+    const footerOpt = interaction.options.getString('footer');
+
+    if (!titleOpt && !descOpt && !colorOpt && !imageOpt && !footerOpt) {
+      return safeReply(interaction, {
+        content: '⚠️ กรุณาระบุอย่างน้อย 1 ตัวเลือก (title/description/color/image/footer/reset)',
+        ephemeral: true,
+      });
+    }
+
+    const cfg = { ...(data.config.panelEmbed || DEFAULT_DATA.config.panelEmbed) };
+
+    if (titleOpt) cfg.title = titleOpt;
+    if (descOpt) cfg.description = descOpt;
+
+    if (colorOpt) {
+      const parsed = parseHexColor(colorOpt);
+      if (parsed === null) {
+        return safeReply(interaction, {
+          content: '⚠️ สีไม่ถูกต้อง กรุณาใส่เป็น hex เช่น `#5865F2`',
+          ephemeral: true,
+        });
+      }
+      cfg.color = parsed;
+    }
+
+    if (imageOpt) {
+      if (imageOpt.toLowerCase() === 'none') {
+        cfg.image = null;
+      } else if (!isValidUrl(imageOpt)) {
+        return safeReply(interaction, { content: '⚠️ Image URL ไม่ถูกต้อง', ephemeral: true });
+      } else {
+        cfg.image = imageOpt;
+      }
+    }
+
+    if (footerOpt) {
+      cfg.footer = footerOpt.toLowerCase() === 'none' ? null : footerOpt;
+    }
+
+    data.config.panelEmbed = cfg;
+    saveData();
+
+    return safeReply(interaction, {
+      content: '✅ อัปเดต Panel Embed แล้ว (ใช้ `/bug panel` เพื่อโพสต์แผงใหม่ในช่องนี้)',
+      embeds: [buildPanelEmbed()],
+      ephemeral: true,
+    });
+  }
 }
 
 /* -------------------- Buttons -------------------- */
@@ -837,6 +969,12 @@ async function handleModalSubmit(interaction) {
     return safeReply(interaction, { content: '⚠️ กรุณากรอกข้อมูลให้ครบถ้วน', ephemeral: true });
   }
 
+  // Count this as a report attempt now (not only once severity is finally
+  // picked) - otherwise a user could open the modal endlessly without ever
+  // selecting a severity and completely bypass the cooldown/rate limit.
+  recordReportAttempt(userId);
+  saveData();
+
   // duplicate detection against user's most recent bug
   const lastBug = getUserLastBug(userId);
   if (lastBug) {
@@ -936,20 +1074,22 @@ async function handleNewSeveritySelected(interaction) {
       createdAt: Date.now(),
       fixedAt: null,
       channelId: null,
+      ticketMessageId: null,
       escalated: false,
+      criticalSince: severity === 'critical' ? Date.now() : null,
     };
     data.bugs[bugId] = bug;
     data.activeTickets[userId] = bugId;
-    recordReportAttempt(userId);
     saveData();
   });
 
   try {
     const channel = await createTicketChannel(guild, bug);
     bug.channelId = channel.id;
-    saveData();
 
-    await channel.send({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
+    const ticketMsg = await channel.send({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
+    bug.ticketMessageId = ticketMsg.id;
+    saveData();
 
     if (severity === 'critical') {
       await sendCriticalAlert(bug);
@@ -971,6 +1111,9 @@ async function handleNewSeveritySelected(interaction) {
 async function handleStatusSelected(interaction, bugId) {
   const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
+  if (!isAdmin(interaction.member)) {
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนสถานะ', ephemeral: true });
+  }
   const newStatus = interaction.values[0];
   await interaction.deferUpdate().catch(() => {});
   const channel = interaction.channel;
@@ -983,6 +1126,9 @@ async function handleStatusSelected(interaction, bugId) {
 async function handleSeveritySelected(interaction, bugId) {
   const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
+  if (!isAdmin(interaction.member)) {
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนความรุนแรง', ephemeral: true });
+  }
   const newSeverity = interaction.values[0];
   await interaction.deferUpdate().catch(() => {});
   const channel = interaction.channel;
@@ -1020,7 +1166,13 @@ async function applySeverityChange(bug, newSeverity, channel) {
   const oldSeverity = bug.severity;
   if (oldSeverity === newSeverity) return;
   bug.severity = newSeverity;
-  if (newSeverity === 'critical') bug.escalated = false;
+  if (newSeverity === 'critical') {
+    bug.escalated = false;
+    bug.criticalSince = Date.now();
+  } else {
+    bug.criticalSince = null;
+    bug.escalated = false;
+  }
   saveData();
 
   if (channel) {
@@ -1034,10 +1186,21 @@ async function applySeverityChange(bug, newSeverity, channel) {
 
 async function refreshTicketEmbed(channel, bug) {
   try {
-    const messages = await channel.messages.fetch({ limit: 20 });
-    const botMsg = messages.find(
-      (m) => m.author.id === client.user.id && m.embeds[0] && m.embeds[0].title === `🐛 ${bug.id}`
-    );
+    let botMsg = null;
+    if (bug.ticketMessageId) {
+      botMsg = await channel.messages.fetch(bug.ticketMessageId).catch(() => null);
+    }
+    if (!botMsg) {
+      // fallback for older tickets created before ticketMessageId was tracked
+      const messages = await channel.messages.fetch({ limit: 20 });
+      botMsg = messages.find(
+        (m) => m.author.id === client.user.id && m.embeds[0] && m.embeds[0].title === `🐛 ${bug.id}`
+      );
+      if (botMsg) {
+        bug.ticketMessageId = botMsg.id;
+        saveData();
+      }
+    }
     if (botMsg) {
       await botMsg.edit({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
     }
@@ -1078,6 +1241,40 @@ function getBugIdFromChannel(channelId) {
   }
   return null;
 }
+
+/* ============================================================
+   MINI HTTP SERVER
+   ------------------------------------------------------------
+   Render's free tier only supports "Web Service" instances, which
+   require the process to bind to $PORT and respond to HTTP
+   requests (used for Render's own health checks). A plain
+   background worker isn't available on the free plan, so this
+   tiny server exists purely to satisfy that requirement - it has
+   nothing to do with the bot's actual functionality.
+
+   Note: Render's free web services spin down after ~15 minutes
+   of no incoming HTTP traffic and cold-start on the next request,
+   which will disconnect the Discord bot in between. If you need
+   the bot online 24/7, either upgrade to a paid Render instance
+   type, or set up an external uptime pinger (e.g. UptimeRobot,
+   cron-job.org) to hit this server's URL every 5-10 minutes.
+   ============================================================ */
+
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(
+      client.isReady()
+        ? `OK - logged in as ${client.user.tag}`
+        : 'OK - bot is starting...'
+    );
+  })
+  .listen(PORT, () => {
+    console.log(`[http] health check server listening on port ${PORT}`);
+  });
 
 /* ============================================================
    SAFETY NETS
