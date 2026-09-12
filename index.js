@@ -1142,6 +1142,25 @@ function getBugIdFromChannel(channelId) {
 }
 
 /* ============================================================
+   KEEP-ALIVE SERVER (สำหรับ Render ฟรี ที่ต้องมี PORT เปิดไว้เช็ค health)
+   ถ้ารันเป็น Background Worker ไม่มี PORT ให้มา ก็แค่ข้ามส่วนนี้ไปเฉย ๆ
+   ============================================================ */
+
+const http = require('http');
+const PORT = process.env.PORT;
+
+if (PORT) {
+  http
+    .createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('bot is alive');
+    })
+    .listen(PORT, () => {
+      console.log(`[keepalive] listening on port ${PORT}`);
+    });
+}
+
+/* ============================================================
    SAFETY NETS
    ============================================================ */
 
