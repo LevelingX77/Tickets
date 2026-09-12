@@ -1,7 +1,8 @@
 'use strict';
 
 /* ============================================================
-   Discord Bug Report Bot - single-file implementation
+   Discord Bug Report Bot
+   ทำเป็นไฟล์เดียวจบ อ่านง่ายกว่าแยกหลายไฟล์สำหรับบอทขนาดนี้
    ============================================================ */
 
 const fs = require('fs');
@@ -28,23 +29,21 @@ const {
 } = require('discord.js');
 
 /* ============================================================
-   CONFIG - default values (override via Environment Variables)
+   CONFIG - ค่าเริ่มต้น (override ผ่าน Environment Variables ได้)
    ============================================================ */
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID || null;
 const GUILD_ID = process.env.GUILD_ID || null;
-// TICKET_CATEGORY_ID is configured at runtime via /bug set-ticket-category and stored in data.config
-// LOG_CHANNEL_ID / ANNOUNCE_CHANNEL_ID / ADMIN_ROLE_ID / DEVELOPER_ROLE_ID
-// are configured at runtime via /bug config commands and stored in data.json (data.config)
+// TICKET_CATEGORY_ID / LOG_CHANNEL_ID / ANNOUNCE_CHANNEL_ID / ADMIN_ROLE_ID / DEVELOPER_ROLE_ID
+// ตั้งค่าตอนรันไทม์ผ่านคำสั่ง /bug config ต่าง ๆ แล้วเก็บลง data.json (data.config)
 
-const COOLDOWN = 5 * 60 * 1000;                // 5 minutes
-const RATE_LIMIT = 3;                          // 3 reports
-const RATE_WINDOW = 10 * 60 * 1000;            // per 10 minutes
-const CRITICAL_ESCALATION = 6 * 60 * 60 * 1000; // 6 hours
-const ESCALATION_CHECK_INTERVAL = 5 * 60 * 1000; // check every 5 min
-const DUPLICATE_THRESHOLD = 0.5;               // jaccard similarity
-const PENDING_TTL = 10 * 60 * 1000;            // 10 min in-memory pending reports
+const COOLDOWN = 5 * 60 * 1000;                // กันสแปม 5 นาทีต่อคน
+const RATE_LIMIT = 3;                          // แจ้งได้ 3 ครั้ง
+const RATE_WINDOW = 10 * 60 * 1000;            // ต่อ 10 นาที
+const DUPLICATE_THRESHOLD = 0.5;               // jaccard similarity เอาไว้เช็คบั๊กซ้ำ
+const PENDING_TTL = 10 * 60 * 1000;            // เก็บรายงานที่ค้าง (ยังไม่เลือกบอท) ไว้ในแรมแค่ 10 นาที
+const MAX_BOT_LIST = 25;                       // Discord select menu จำกัด option ไว้ที่ 25 ตัว
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 
@@ -54,47 +53,20 @@ const DATA_FILE = path.join(__dirname, 'data.json');
 
 const DEFAULT_DATA = {
   counter: 0,
-  bugs: {},          // bugId -> bug object
-  blacklist: [],      // array of userIds
-  activeTickets: {},  // userId -> bugId
-  cooldowns: {},      // userId -> timestamp of last report
-  rateLimits: {},     // userId -> [timestamps]
+  bugs: {},           // bugId -> bug object
+  blacklist: [],       // userId ที่โดนแบนไม่ให้แจ้งบั๊ก
+  activeTickets: {},   // userId -> bugId (ที่ยังเปิดอยู่)
+  cooldowns: {},       // userId -> เวลาแจ้งล่าสุด
+  rateLimits: {},      // userId -> [timestamps]
   config: {
     logChannelId: null,
     announceChannelId: null,
     adminRoleId: null,
     developerRoleId: null,
     ticketCategoryId: null,
-    // customizable panel embed (edit via /bug embed)
-    panelEmbed: {
-      title: 'Tickets Report Bug Bot',
-      description: 'กดปุ่มด้านล่างเพื่อรายงานบัคที่เกิดขึ้น ( กดเล่นโดน Blacklist )',
-      color: 0x5865f2,
-      image: null,
-      footer: null,
-    },
+    bots: [],           // รายชื่อบอทที่ให้เลือกตอนแจ้งบั๊ก (แอดมินเป็นคนตั้ง)
   },
 };
-
-// Deep-merge helper so that older/partial data.json files (saved before new
-// config fields existed) don't wipe out newly-added defaults. A plain
-// Object.assign only merges top-level keys, so nested objects like
-// `config` or `config.panelEmbed` would otherwise be replaced wholesale
-// and lose any new sub-fields, causing "Cannot read properties of
-// undefined" crashes after an update.
-function deepMerge(base, override) {
-  if (Array.isArray(base)) return Array.isArray(override) ? override : base;
-  if (base && typeof base === 'object') {
-    const out = { ...base };
-    if (override && typeof override === 'object') {
-      for (const key of Object.keys(override)) {
-        out[key] = deepMerge(base[key], override[key]);
-      }
-    }
-    return out;
-  }
-  return override === undefined ? base : override;
-}
 
 function loadData() {
   try {
@@ -104,7 +76,13 @@ function loadData() {
     }
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
-    return deepMerge(JSON.parse(JSON.stringify(DEFAULT_DATA)), parsed);
+    const merged = Object.assign(JSON.parse(JSON.stringify(DEFAULT_DATA)), parsed);
+    // แก้บั๊ก: เดิม merge แบบตื้น (shallow) ทำให้ถ้า data.json เก่าไม่มีคีย์ใหม่ใน config
+    // (เช่น bots ที่เพิ่งเพิ่มเข้ามา) ค่าเริ่มต้นของ config จะหายไปทั้งก้อนเพราะโดน parsed.config ทับ
+    // เลย merge config แยกอีกชั้นเพื่อไม่ให้ค่า default ของฟิลด์ใหม่ ๆ หายไป
+    merged.config = Object.assign(JSON.parse(JSON.stringify(DEFAULT_DATA.config)), parsed.config || {});
+    if (!Array.isArray(merged.config.bots)) merged.config.bots = [];
+    return merged;
   } catch (err) {
     console.error('[storage] failed to load data.json, using defaults:', err.message);
     return JSON.parse(JSON.stringify(DEFAULT_DATA));
@@ -113,7 +91,7 @@ function loadData() {
 
 let data = loadData();
 
-// simple write lock to avoid concurrent/racy writes corrupting the file
+// write lock กัน race condition ตอนเขียนไฟล์พร้อมกันหลาย ๆ ที
 let writeChain = Promise.resolve();
 function saveData() {
   writeChain = writeChain.then(() => {
@@ -126,7 +104,7 @@ function saveData() {
   return writeChain;
 }
 
-// mutex for critical sections (bug id creation etc.)
+// mutex สำหรับ critical section (ตอนสร้างเลข bug id ใหม่)
 let mutex = Promise.resolve();
 function withLock(fn) {
   const run = mutex.then(fn, fn);
@@ -138,36 +116,25 @@ function withLock(fn) {
    CONSTANTS / MAPS
    ============================================================ */
 
-const SEVERITY = {
-  low: { emoji: '🟢', label: 'Low' },
-  medium: { emoji: '🟡', label: 'Medium' },
-  high: { emoji: '🟠', label: 'High' },
-  critical: { emoji: '🔴', label: 'Critical' },
-};
-
 const STATUS = {
-  open: { emoji: '🟡', label: 'Open' },
-  investigating: { emoji: '🔵', label: 'Investigating' },
-  in_progress: { emoji: '🟠', label: 'In Progress' },
-  fixed: { emoji: '🟢', label: 'Fixed' },
-  closed: { emoji: '⚫', label: 'Closed' },
-  rejected: { emoji: '🔴', label: 'Rejected' },
+  open: { emoji: '🟡', label: 'เปิดรับแจ้ง' },
+  investigating: { emoji: '🔵', label: 'กำลังตรวจสอบ' },
+  in_progress: { emoji: '🟠', label: 'กำลังแก้ไข' },
+  fixed: { emoji: '🟢', label: 'แก้ไขแล้ว' },
+  closed: { emoji: '⚫', label: 'ปิดแล้ว' },
+  rejected: { emoji: '🔴', label: 'ไม่รับแก้' },
 };
 
 const RESOLVED_STATUSES = ['fixed'];
 const TERMINAL_STATUSES = ['fixed', 'closed', 'rejected'];
 
-function sevText(key) {
-  const s = SEVERITY[key] || SEVERITY.low;
-  return `${s.emoji} ${s.label}`;
-}
 function statusText(key) {
   const s = STATUS[key] || STATUS.open;
   return `${s.emoji} ${s.label}`;
 }
 
 /* ============================================================
-   IN-MEMORY PENDING REPORTS (title/description before severity picked)
+   รายงานที่ยังค้างอยู่ (มีหัวข้อ/รายละเอียดแล้ว แต่ยังไม่ได้เลือกบอท)
    ============================================================ */
 
 const pendingReports = new Map(); // userId -> { title, description, expiresAt }
@@ -227,21 +194,6 @@ function jaccardSimilarity(a, b) {
   for (const w of setA) if (setB.has(w)) intersection++;
   const union = new Set([...setA, ...setB]).size;
   return union === 0 ? 0 : intersection / union;
-}
-
-function parseHexColor(str) {
-  const cleaned = String(str).trim().replace(/^#/, '');
-  if (!/^[0-9a-fA-F]{6}$/.test(cleaned)) return null;
-  return parseInt(cleaned, 16);
-}
-
-function isValidUrl(str) {
-  try {
-    const u = new URL(str);
-    return u.protocol === 'http:' || u.protocol === 'https:';
-  } catch {
-    return false;
-  }
 }
 
 function isBlacklisted(userId) {
@@ -318,25 +270,55 @@ async function safeReply(interaction, options) {
 }
 
 /* ============================================================
+   รายชื่อบอทที่แอดมินตั้งไว้ให้เลือกตอนแจ้งบั๊ก
+   ============================================================ */
+
+function getBotList() {
+  return Array.isArray(data.config.bots) ? data.config.bots : [];
+}
+
+function addBotToList(name) {
+  const trimmed = (name || '').trim();
+  if (!trimmed) return { ok: false, reason: 'empty' };
+  const list = getBotList();
+  if (list.some((b) => b.toLowerCase() === trimmed.toLowerCase())) {
+    return { ok: false, reason: 'duplicate' };
+  }
+  if (list.length >= MAX_BOT_LIST) {
+    return { ok: false, reason: 'full' };
+  }
+  list.push(trimmed);
+  data.config.bots = list;
+  saveData();
+  return { ok: true };
+}
+
+function removeBotFromList(name) {
+  const trimmed = (name || '').trim().toLowerCase();
+  const list = getBotList();
+  const next = list.filter((b) => b.toLowerCase() !== trimmed);
+  if (next.length === list.length) return { ok: false };
+  data.config.bots = next;
+  saveData();
+  return { ok: true };
+}
+
+/* ============================================================
    EMBED BUILDERS
    ============================================================ */
 
 function buildPanelEmbed() {
-  const cfg = data.config.panelEmbed || DEFAULT_DATA.config.panelEmbed;
-  const embed = new EmbedBuilder()
-    .setTitle(cfg.title || DEFAULT_DATA.config.panelEmbed.title)
-    .setDescription(cfg.description || DEFAULT_DATA.config.panelEmbed.description)
-    .setColor(typeof cfg.color === 'number' ? cfg.color : DEFAULT_DATA.config.panelEmbed.color);
-  if (cfg.image) embed.setImage(cfg.image);
-  if (cfg.footer) embed.setFooter({ text: cfg.footer });
-  return embed;
+  return new EmbedBuilder()
+    .setTitle('ระบบแจ้งบั๊ก')
+    .setDescription('กดปุ่มด้านล่างเพื่อแจ้งบั๊กที่เจอ ( กดเล่น ๆ เดี๋ยวโดนแบล็คลิสต์ )')
+    .setColor(0x5865f2);
 }
 
 function buildPanelRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('bug_report_btn')
-      .setLabel('Report Bug')
+      .setLabel('แจ้งบั๊ก')
       .setEmoji('🚨')
       .setStyle(ButtonStyle.Danger)
   );
@@ -351,24 +333,24 @@ function buildTicketEmbed(bug) {
   const embed = new EmbedBuilder()
     .setTitle(`🐛 ${bug.id}`)
     .addFields(
-      { name: '👤 Reporter', value: `<@${bug.reporterId}>`, inline: false },
-      { name: '📝 Title', value: bug.title.slice(0, 1024), inline: false },
-      { name: '📄 Description', value: bug.description.slice(0, 1024), inline: false },
-      { name: '🚨 Severity', value: sevText(bug.severity), inline: true },
-      { name: '🔄 Status', value: statusText(bug.status), inline: true },
-      { name: '⏱️ Resolution Time', value: formatDuration(computeResolutionMs(bug)), inline: true }
+      { name: '👤 ผู้แจ้ง', value: `<@${bug.reporterId}>`, inline: false },
+      { name: '📝 หัวข้อ', value: bug.title.slice(0, 1024), inline: false },
+      { name: '📄 รายละเอียด', value: bug.description.slice(0, 1024), inline: false },
+      { name: '🤖 บอทที่แจ้ง', value: bug.targetBot || '-', inline: true },
+      { name: '🔄 สถานะ', value: statusText(bug.status), inline: true },
+      { name: '⏱️ ระยะเวลาแก้ไข', value: formatDuration(computeResolutionMs(bug)), inline: true }
     )
-    .setColor(bug.severity === 'critical' ? 0xed4245 : 0x5865f2)
-    .setFooter({ text: `Created ${new Date(bug.createdAt).toLocaleString()}` });
+    .setColor(0x5865f2)
+    .setFooter({ text: `แจ้งเมื่อ ${new Date(bug.createdAt).toLocaleString('th-TH')}` });
   return embed;
 }
 
 function buildTicketRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('bug_status_btn').setLabel('Status').setEmoji('🔄').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('bug_severity_btn').setLabel('Severity').setEmoji('🚨').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('bug_resolve_btn').setLabel('Resolve').setEmoji('📢').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('bug_close_btn').setLabel('Close').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId('bug_status_btn').setLabel('สถานะ').setEmoji('🔄').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('bug_bot_btn').setLabel('เปลี่ยนบอท').setEmoji('🤖').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('bug_resolve_btn').setLabel('แก้ไขแล้ว').setEmoji('📢').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('bug_close_btn').setLabel('ปิด').setEmoji('🔒').setStyle(ButtonStyle.Danger)
   );
 }
 
@@ -382,36 +364,36 @@ const client = new Client({
 });
 
 /* ------------------------------------------------------------
-   Slash command registration
+   ลงทะเบียน Slash command
    ------------------------------------------------------------ */
 
 const commands = [
   new SlashCommandBuilder()
     .setName('bug')
-    .setDescription('Bug report system management')
+    .setDescription('จัดการระบบแจ้งบั๊ก')
     .addSubcommand((sub) =>
-      sub.setName('panel').setDescription('Post the bug report panel in this channel')
+      sub.setName('panel').setDescription('โพสต์แผงปุ่มแจ้งบั๊กในห้องนี้')
     )
     .addSubcommand((sub) =>
       sub
         .setName('blacklist')
-        .setDescription('Blacklist a user from reporting bugs')
-        .addUserOption((opt) => opt.setName('user').setDescription('User to blacklist').setRequired(true))
+        .setDescription('แบนไม่ให้ผู้ใช้คนนี้แจ้งบั๊ก')
+        .addUserOption((opt) => opt.setName('user').setDescription('ผู้ใช้ที่ต้องการแบน').setRequired(true))
     )
     .addSubcommand((sub) =>
       sub
         .setName('unblacklist')
-        .setDescription('Remove a user from the blacklist')
-        .addUserOption((opt) => opt.setName('user').setDescription('User to unblacklist').setRequired(true))
+        .setDescription('ปลดแบนผู้ใช้ออกจากลิสต์')
+        .addUserOption((opt) => opt.setName('user').setDescription('ผู้ใช้ที่ต้องการปลดแบน').setRequired(true))
     )
     .addSubcommand((sub) =>
       sub
         .setName('set-log-channel')
-        .setDescription('Set the channel for critical/escalation alerts')
+        .setDescription('ตั้งห้องสำหรับแจ้งเตือนเวลามีบั๊กใหม่')
         .addChannelOption((opt) =>
           opt
             .setName('channel')
-            .setDescription('Log channel')
+            .setDescription('ห้อง log')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
@@ -419,11 +401,11 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('set-announce-channel')
-        .setDescription('Set the channel for resolved bug announcements')
+        .setDescription('ตั้งห้องสำหรับประกาศบั๊กที่แก้เสร็จแล้ว')
         .addChannelOption((opt) =>
           opt
             .setName('channel')
-            .setDescription('Announcement channel')
+            .setDescription('ห้องประกาศ')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
@@ -431,41 +413,46 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName('set-admin-role')
-        .setDescription('Set the admin role allowed to manage tickets')
-        .addRoleOption((opt) => opt.setName('role').setDescription('Admin role').setRequired(true))
+        .setDescription('ตั้งยศแอดมินที่จัดการ Ticket ได้')
+        .addRoleOption((opt) => opt.setName('role').setDescription('ยศแอดมิน').setRequired(true))
     )
     .addSubcommand((sub) =>
       sub
         .setName('set-developer-role')
-        .setDescription('Set the developer role allowed to manage tickets')
-        .addRoleOption((opt) => opt.setName('role').setDescription('Developer role').setRequired(true))
+        .setDescription('ตั้งยศนักพัฒนาที่จัดการ Ticket ได้')
+        .addRoleOption((opt) => opt.setName('role').setDescription('ยศนักพัฒนา').setRequired(true))
     )
     .addSubcommand((sub) =>
       sub
         .setName('set-ticket-category')
-        .setDescription('Set the category where bug ticket channels are created')
+        .setDescription('ตั้งหมวดหมู่ที่จะใช้สร้างห้อง Ticket')
         .addChannelOption((opt) =>
           opt
             .setName('category')
-            .setDescription('Ticket category')
+            .setDescription('หมวดหมู่ Ticket')
             .addChannelTypes(ChannelType.GuildCategory)
             .setRequired(true)
         )
     )
-    .addSubcommand((sub) =>
-      sub
-        .setName('embed')
-        .setDescription('Customize the report panel embed (title/description/image/footer/color)')
-        .addStringOption((opt) => opt.setName('title').setDescription('Embed title').setMaxLength(256))
-        .addStringOption((opt) => opt.setName('description').setDescription('Embed description').setMaxLength(4000))
-        .addStringOption((opt) => opt.setName('color').setDescription('Hex color, e.g. #5865F2'))
-        .addStringOption((opt) =>
-          opt.setName('image').setDescription('Image URL (use "none" to remove)')
+    .addSubcommandGroup((group) =>
+      group
+        .setName('bot')
+        .setDescription('จัดการรายชื่อบอทที่ให้เลือกตอนแจ้งบั๊ก')
+        .addSubcommand((sub) =>
+          sub
+            .setName('add')
+            .setDescription('เพิ่มชื่อบอทเข้าลิสต์ให้เลือก')
+            .addStringOption((opt) => opt.setName('name').setDescription('ชื่อบอท').setRequired(true))
         )
-        .addStringOption((opt) =>
-          opt.setName('footer').setDescription('Footer text (use "none" to remove)').setMaxLength(2048)
+        .addSubcommand((sub) =>
+          sub
+            .setName('remove')
+            .setDescription('เอาชื่อบอทออกจากลิสต์')
+            .addStringOption((opt) => opt.setName('name').setDescription('ชื่อบอท').setRequired(true))
         )
-        .addBooleanOption((opt) => opt.setName('reset').setDescription('Reset the panel embed to default'))
+        .addSubcommand((sub) =>
+          sub.setName('list').setDescription('ดูรายชื่อบอททั้งหมดในลิสต์ตอนนี้')
+        )
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .toJSON(),
@@ -503,66 +490,28 @@ client.once(Events.ClientReady, async () => {
     console.error('[presence] failed to set presence:', err.message);
   }
   await registerCommands();
-  setInterval(runEscalationCheck, ESCALATION_CHECK_INTERVAL).unref();
 });
 
 /* ------------------------------------------------------------
-   Escalation check
+   แจ้งเตือนต่าง ๆ
    ------------------------------------------------------------ */
 
-async function runEscalationCheck() {
-  try {
-    const now = Date.now();
-    for (const bugId of Object.keys(data.bugs)) {
-      const bug = data.bugs[bugId];
-      if (bug.severity !== 'critical') continue;
-      if (TERMINAL_STATUSES.includes(bug.status)) continue;
-      if (bug.escalated) continue;
-      const since = bug.criticalSince || bug.createdAt;
-      if (now - since >= CRITICAL_ESCALATION) {
-        bug.escalated = true;
-        saveData();
-        await sendEscalationAlert(bug);
-      }
-    }
-  } catch (err) {
-    console.error('[escalation] check failed:', err.message);
-  }
-}
-
-async function sendEscalationAlert(bug) {
+async function sendNewTicketLog(bug) {
   if (!data.config.logChannelId) return;
   try {
     const channel = await client.channels.fetch(data.config.logChannelId).catch(() => null);
     if (!channel) return;
     const embed = new EmbedBuilder()
-      .setTitle('⏰ CRITICAL ESCALATION')
-      .setDescription(`${bug.id}\nBug นี้อยู่ในสถานะ Critical เกิน ${formatDuration(CRITICAL_ESCALATION)} แล้ว`)
-      .addFields(
-        { name: 'Title', value: bug.title.slice(0, 1024) },
-        { name: 'Status', value: statusText(bug.status), inline: true },
-        { name: 'Elapsed', value: formatDuration(Date.now() - (bug.criticalSince || bug.createdAt)), inline: true }
-      )
-      .setColor(0xed4245);
-    await channel.send({ content: bug.channelId ? `<#${bug.channelId}>` : undefined, embeds: [embed] });
-  } catch (err) {
-    console.error('[escalation] failed to send alert:', err.message);
-  }
-}
-
-async function sendCriticalAlert(bug) {
-  if (!data.config.logChannelId) return;
-  try {
-    const channel = await client.channels.fetch(data.config.logChannelId).catch(() => null);
-    if (!channel) return;
-    const embed = new EmbedBuilder()
-      .setTitle('🔴 CRITICAL BUG ALERT')
+      .setTitle('🆕 มีการแจ้งบั๊กใหม่')
       .setDescription(`${bug.id}\n${bug.title.slice(0, 1024)}`)
-      .addFields({ name: 'Status', value: statusText(bug.status), inline: true })
-      .setColor(0xed4245);
+      .addFields(
+        { name: 'บอท', value: bug.targetBot || '-', inline: true },
+        { name: 'ผู้แจ้ง', value: `<@${bug.reporterId}>`, inline: true }
+      )
+      .setColor(0x5865f2);
     await channel.send({ content: bug.channelId ? `<#${bug.channelId}>` : undefined, embeds: [embed] });
   } catch (err) {
-    console.error('[critical] failed to send alert:', err.message);
+    console.error('[log] failed to send new ticket log:', err.message);
   }
 }
 
@@ -572,9 +521,12 @@ async function sendResolvedAnnouncement(bug) {
     const channel = await client.channels.fetch(data.config.announceChannelId).catch(() => null);
     if (!channel) return;
     const embed = new EmbedBuilder()
-      .setTitle('✅ BUG RESOLVED')
+      .setTitle('✅ แก้บั๊กเรียบร้อยแล้ว')
       .setDescription(`${bug.id}\nปัญหา: ${bug.title.slice(0, 1024)}`)
-      .addFields({ name: 'Status', value: statusText(bug.status), inline: true })
+      .addFields(
+        { name: 'บอท', value: bug.targetBot || '-', inline: true },
+        { name: 'สถานะ', value: statusText(bug.status), inline: true }
+      )
       .setColor(0x57f287);
     await channel.send({ embeds: [embed] });
   } catch (err) {
@@ -595,7 +547,7 @@ async function sendTicketUpdate(channel, title, bugId, fromText, toText) {
 }
 
 /* ------------------------------------------------------------
-   Ticket channel creation
+   สร้างห้อง Ticket
    ------------------------------------------------------------ */
 
 async function createTicketChannel(guild, bug) {
@@ -659,6 +611,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 async function handleSlashCommand(interaction) {
   if (interaction.commandName !== 'bug') return;
+
+  const group = interaction.options.getSubcommandGroup(false);
+  if (group === 'bot') {
+    return handleBotListCommand(interaction, interaction.options.getSubcommand());
+  }
+
   const sub = interaction.options.getSubcommand();
 
   if (sub === 'panel') {
@@ -677,7 +635,7 @@ async function handleSlashCommand(interaction) {
     if (sub === 'blacklist') {
       if (!data.blacklist.includes(user.id)) data.blacklist.push(user.id);
       saveData();
-      return safeReply(interaction, { content: `🚫 บล็อก <@${user.id}> จากการรายงานบั๊กแล้ว`, ephemeral: true });
+      return safeReply(interaction, { content: `🚫 บล็อก <@${user.id}> จากการแจ้งบั๊กแล้ว`, ephemeral: true });
     } else {
       data.blacklist = data.blacklist.filter((id) => id !== user.id);
       saveData();
@@ -692,7 +650,7 @@ async function handleSlashCommand(interaction) {
     const channel = interaction.options.getChannel('channel', true);
     data.config.logChannelId = channel.id;
     saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่า Log Channel เป็น <#${channel.id}> แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ ตั้งค่าห้อง Log เป็น <#${channel.id}> แล้ว`, ephemeral: true });
   }
 
   if (sub === 'set-announce-channel') {
@@ -702,7 +660,7 @@ async function handleSlashCommand(interaction) {
     const channel = interaction.options.getChannel('channel', true);
     data.config.announceChannelId = channel.id;
     saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่า Announcement Channel เป็น <#${channel.id}> แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ ตั้งค่าห้องประกาศเป็น <#${channel.id}> แล้ว`, ephemeral: true });
   }
 
   if (sub === 'set-admin-role') {
@@ -712,7 +670,7 @@ async function handleSlashCommand(interaction) {
     const role = interaction.options.getRole('role', true);
     data.config.adminRoleId = role.id;
     saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่า Admin Role เป็น <@&${role.id}> แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ ตั้งค่ายศแอดมินเป็น <@&${role.id}> แล้ว`, ephemeral: true });
   }
 
   if (sub === 'set-developer-role') {
@@ -722,7 +680,7 @@ async function handleSlashCommand(interaction) {
     const role = interaction.options.getRole('role', true);
     data.config.developerRoleId = role.id;
     saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่า Developer Role เป็น <@&${role.id}> แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ ตั้งค่ายศนักพัฒนาเป็น <@&${role.id}> แล้ว`, ephemeral: true });
   }
 
   if (sub === 'set-ticket-category') {
@@ -732,76 +690,44 @@ async function handleSlashCommand(interaction) {
     const category = interaction.options.getChannel('category', true);
     data.config.ticketCategoryId = category.id;
     saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่า Ticket Category เป็น **${category.name}** แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ ตั้งค่าหมวดหมู่ Ticket เป็น **${category.name}** แล้ว`, ephemeral: true });
+  }
+}
+
+async function handleBotListCommand(interaction, sub) {
+  if (!isAdmin(interaction.member)) {
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
   }
 
-  if (sub === 'embed') {
-    if (!isAdmin(interaction.member)) {
-      return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
+  if (sub === 'add') {
+    const name = interaction.options.getString('name', true);
+    const result = addBotToList(name);
+    if (!result.ok) {
+      const msg =
+        result.reason === 'duplicate' ? '⚠️ มีชื่อนี้อยู่ในลิสต์อยู่แล้ว' :
+        result.reason === 'full' ? `⚠️ ลิสต์เต็มแล้ว (สูงสุด ${MAX_BOT_LIST} รายการ)` :
+        '⚠️ กรุณาระบุชื่อบอทด้วย';
+      return safeReply(interaction, { content: msg, ephemeral: true });
     }
+    return safeReply(interaction, { content: `✅ เพิ่ม **${name.trim()}** เข้าลิสต์ให้เลือกตอนแจ้งบั๊กแล้ว`, ephemeral: true });
+  }
 
-    const reset = interaction.options.getBoolean('reset');
-    if (reset) {
-      data.config.panelEmbed = { ...DEFAULT_DATA.config.panelEmbed };
-      saveData();
-      return safeReply(interaction, {
-        content: '✅ รีเซ็ต Panel Embed กลับเป็นค่าเริ่มต้นแล้ว ใช้ `/bug panel` เพื่อโพสต์ใหม่',
-        embeds: [buildPanelEmbed()],
-        ephemeral: true,
-      });
+  if (sub === 'remove') {
+    const name = interaction.options.getString('name', true);
+    const result = removeBotFromList(name);
+    if (!result.ok) {
+      return safeReply(interaction, { content: '⚠️ ไม่พบชื่อนี้ในลิสต์', ephemeral: true });
     }
+    return safeReply(interaction, { content: `✅ เอา **${name.trim()}** ออกจากลิสต์แล้ว`, ephemeral: true });
+  }
 
-    const titleOpt = interaction.options.getString('title');
-    const descOpt = interaction.options.getString('description');
-    const colorOpt = interaction.options.getString('color');
-    const imageOpt = interaction.options.getString('image');
-    const footerOpt = interaction.options.getString('footer');
-
-    if (!titleOpt && !descOpt && !colorOpt && !imageOpt && !footerOpt) {
-      return safeReply(interaction, {
-        content: '⚠️ กรุณาระบุอย่างน้อย 1 ตัวเลือก (title/description/color/image/footer/reset)',
-        ephemeral: true,
-      });
+  if (sub === 'list') {
+    const list = getBotList();
+    if (list.length === 0) {
+      return safeReply(interaction, { content: 'ตอนนี้ยังไม่มีชื่อบอทในลิสต์เลย ใช้ `/bug bot add` เพื่อเพิ่มก่อนนะ', ephemeral: true });
     }
-
-    const cfg = { ...(data.config.panelEmbed || DEFAULT_DATA.config.panelEmbed) };
-
-    if (titleOpt) cfg.title = titleOpt;
-    if (descOpt) cfg.description = descOpt;
-
-    if (colorOpt) {
-      const parsed = parseHexColor(colorOpt);
-      if (parsed === null) {
-        return safeReply(interaction, {
-          content: '⚠️ สีไม่ถูกต้อง กรุณาใส่เป็น hex เช่น `#5865F2`',
-          ephemeral: true,
-        });
-      }
-      cfg.color = parsed;
-    }
-
-    if (imageOpt) {
-      if (imageOpt.toLowerCase() === 'none') {
-        cfg.image = null;
-      } else if (!isValidUrl(imageOpt)) {
-        return safeReply(interaction, { content: '⚠️ Image URL ไม่ถูกต้อง', ephemeral: true });
-      } else {
-        cfg.image = imageOpt;
-      }
-    }
-
-    if (footerOpt) {
-      cfg.footer = footerOpt.toLowerCase() === 'none' ? null : footerOpt;
-    }
-
-    data.config.panelEmbed = cfg;
-    saveData();
-
-    return safeReply(interaction, {
-      content: '✅ อัปเดต Panel Embed แล้ว (ใช้ `/bug panel` เพื่อโพสต์แผงใหม่ในช่องนี้)',
-      embeds: [buildPanelEmbed()],
-      ephemeral: true,
-    });
+    const listText = list.map((b, i) => `${i + 1}. ${b}`).join('\n');
+    return safeReply(interaction, { content: `📋 รายชื่อบอทที่แจ้งบั๊กได้ตอนนี้:\n${listText}`, ephemeral: true });
   }
 }
 
@@ -813,7 +739,7 @@ async function handleButton(interaction) {
   if (id === 'bug_report_btn') return handleReportButton(interaction);
   if (id === 'bug_report_new_anyway') return handleCreateNewAnyway(interaction);
   if (id === 'bug_status_btn') return handleStatusButton(interaction);
-  if (id === 'bug_severity_btn') return handleSeverityButton(interaction);
+  if (id === 'bug_bot_btn') return handleBotButton(interaction);
   if (id === 'bug_resolve_btn') return handleResolveButton(interaction);
   if (id === 'bug_close_btn') return handleCloseButton(interaction);
 }
@@ -822,7 +748,7 @@ async function handleReportButton(interaction) {
   const userId = interaction.user.id;
 
   if (isBlacklisted(userId)) {
-    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การรายงานบั๊ก', ephemeral: true });
+    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การแจ้งบั๊ก', ephemeral: true });
   }
 
   const active = getUserActiveBug(userId);
@@ -836,7 +762,7 @@ async function handleReportButton(interaction) {
   const cd = checkCooldown(userId);
   if (!cd.ok) {
     return safeReply(interaction, {
-      content: `⏳ กรุณารออีก ${formatDuration(cd.remaining)} ก่อนรายงานบั๊กครั้งถัดไป`,
+      content: `⏳ กรุณารออีก ${formatDuration(cd.remaining)} ก่อนแจ้งบั๊กครั้งถัดไป`,
       ephemeral: true,
     });
   }
@@ -849,16 +775,16 @@ async function handleReportButton(interaction) {
     });
   }
 
-  const modal = new ModalBuilder().setCustomId('bug_report_modal').setTitle('🐛 Report Bug');
+  const modal = new ModalBuilder().setCustomId('bug_report_modal').setTitle('🐛 แจ้งบั๊ก');
   const titleInput = new TextInputBuilder()
     .setCustomId('bug_title')
-    .setLabel('หัวข้อ Bug')
+    .setLabel('หัวข้อบั๊ก')
     .setStyle(TextInputStyle.Short)
     .setMaxLength(100)
     .setRequired(true);
   const descInput = new TextInputBuilder()
     .setCustomId('bug_description')
-    .setLabel('รายละเอียด Bug')
+    .setLabel('รายละเอียดบั๊ก')
     .setStyle(TextInputStyle.Paragraph)
     .setMaxLength(1000)
     .setRequired(true);
@@ -875,7 +801,7 @@ async function handleCreateNewAnyway(interaction) {
   if (!pending) {
     return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูลรายงานที่ค้างไว้ กรุณาเริ่มใหม่', ephemeral: true });
   }
-  await presentSeveritySelect(interaction, pending);
+  await presentBotSelect(interaction, pending);
 }
 
 async function handleStatusButton(interaction) {
@@ -898,31 +824,34 @@ async function handleStatusButton(interaction) {
   await safeReply(interaction, { components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true, content: `เปลี่ยนสถานะของ ${bug.id}` });
 }
 
-async function handleSeverityButton(interaction) {
+async function handleBotButton(interaction) {
   const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
   if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนความรุนแรง', ephemeral: true });
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนบอทที่แจ้ง', ephemeral: true });
+  }
+  const list = getBotList();
+  if (list.length === 0) {
+    return safeReply(interaction, { content: '⚠️ ยังไม่มีรายชื่อบอทให้เลือกเลย (ใช้ /bug bot add ก่อน)', ephemeral: true });
   }
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`bug_severity_select_${bug.id}`)
-    .setPlaceholder('เลือกความรุนแรงใหม่')
+    .setCustomId(`bug_bot_select_${bug.id}`)
+    .setPlaceholder('เลือกบอทใหม่')
     .addOptions(
-      Object.entries(SEVERITY).map(([key, val]) => ({
-        label: val.label,
-        value: key,
-        emoji: val.emoji,
-        default: key === bug.severity,
+      list.slice(0, MAX_BOT_LIST).map((name) => ({
+        label: name.slice(0, 100),
+        value: name,
+        default: name === bug.targetBot,
       }))
     );
-  await safeReply(interaction, { components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true, content: `เปลี่ยนความรุนแรงของ ${bug.id}` });
+  await safeReply(interaction, { components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true, content: `เปลี่ยนบอทที่แจ้งของ ${bug.id}` });
 }
 
 async function handleResolveButton(interaction) {
   const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
   if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ Resolve', ephemeral: true });
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์กดแก้ไขแล้ว', ephemeral: true });
   }
   await interaction.deferUpdate().catch(() => {});
   await applyStatusChange(bug, 'fixed', interaction.channel);
@@ -946,9 +875,9 @@ async function handleModalSubmit(interaction) {
   if (interaction.customId !== 'bug_report_modal') return;
   const userId = interaction.user.id;
 
-  // re-verify critical checks in case of race between button click and submit
+  // เช็คซ้ำอีกรอบเผื่อมีอะไรเปลี่ยนไประหว่างกดปุ่มกับตอนกด submit modal
   if (isBlacklisted(userId)) {
-    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การรายงานBug', ephemeral: true });
+    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การแจ้งบั๊ก', ephemeral: true });
   }
   if (getUserActiveBug(userId)) {
     return safeReply(interaction, { content: '⚠️ คุณมี Ticket ที่ยังเปิดอยู่แล้ว', ephemeral: true });
@@ -969,21 +898,15 @@ async function handleModalSubmit(interaction) {
     return safeReply(interaction, { content: '⚠️ กรุณากรอกข้อมูลให้ครบถ้วน', ephemeral: true });
   }
 
-  // Count this as a report attempt now (not only once severity is finally
-  // picked) - otherwise a user could open the modal endlessly without ever
-  // selecting a severity and completely bypass the cooldown/rate limit.
-  recordReportAttempt(userId);
-  saveData();
-
-  // duplicate detection against user's most recent bug
+  // เช็คว่าซ้ำกับบั๊กล่าสุดของคนเดิมไหม (เทียบด้วย jaccard)
   const lastBug = getUserLastBug(userId);
   if (lastBug) {
     const similarity = jaccardSimilarity(title, lastBug.title);
     if (similarity >= DUPLICATE_THRESHOLD) {
       setPending(userId, { title, description });
       const embed = new EmbedBuilder()
-        .setTitle('🔎 Possible Duplicate')
-        .setDescription(`${lastBug.id}\nTitle: ${lastBug.title.slice(0, 500)}`)
+        .setTitle('🔎 อาจจะซ้ำกับรายงานเดิม')
+        .setDescription(`${lastBug.id}\nหัวข้อ: ${lastBug.title.slice(0, 500)}`)
         .setColor(0xfee75c);
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('bug_report_new_anyway').setLabel('สร้าง Bug ใหม่').setStyle(ButtonStyle.Primary)
@@ -1000,19 +923,28 @@ async function handleModalSubmit(interaction) {
     }
   }
 
-  await presentSeveritySelect(interaction, { title, description });
+  await presentBotSelect(interaction, { title, description });
 }
 
-async function presentSeveritySelect(interaction, payload) {
+async function presentBotSelect(interaction, payload) {
+  const list = getBotList();
+  if (list.length === 0) {
+    // ไม่ล้าง pending ตรงนี้ เผื่อแอดมินรีบเพิ่มลิสต์แล้วผู้ใช้กด "สร้าง Bug ใหม่" ซ้ำได้ทันที
+    return safeReply(interaction, {
+      content: '⚠️ แอดมินยังไม่ได้ตั้งรายชื่อบอทให้เลือกเลย รบกวนแจ้งแอดมินให้เพิ่มก่อน (คำสั่ง `/bug bot add`)',
+      ephemeral: true,
+    });
+  }
+
   setPending(interaction.user.id, payload);
   const menu = new StringSelectMenuBuilder()
-    .setCustomId('bug_new_severity_select')
-    .setPlaceholder('เลือกความรุนแรงของBug')
+    .setCustomId('bug_new_bot_select')
+    .setPlaceholder('เลือกบอทที่เจอบั๊ก')
     .addOptions(
-      Object.entries(SEVERITY).map(([key, val]) => ({ label: val.label, value: key, emoji: val.emoji }))
+      list.slice(0, MAX_BOT_LIST).map((name) => ({ label: name.slice(0, 100), value: name }))
     );
   await safeReply(interaction, {
-    content: 'กรุณาเลือกระดับความรุนแรงของBug',
+    content: 'กรุณาเลือกว่าบั๊กนี้เจอในบอทตัวไหน',
     components: [new ActionRowBuilder().addComponents(menu)],
     ephemeral: true,
   });
@@ -1023,35 +955,35 @@ async function presentSeveritySelect(interaction, payload) {
 async function handleSelectMenu(interaction) {
   const id = interaction.customId;
 
-  if (id === 'bug_new_severity_select') {
-    return handleNewSeveritySelected(interaction);
+  if (id === 'bug_new_bot_select') {
+    return handleNewBotSelected(interaction);
   }
   if (id.startsWith('bug_status_select_')) {
     return handleStatusSelected(interaction, id.replace('bug_status_select_', ''));
   }
-  if (id.startsWith('bug_severity_select_')) {
-    return handleSeveritySelected(interaction, id.replace('bug_severity_select_', ''));
+  if (id.startsWith('bug_bot_select_')) {
+    return handleBotSelected(interaction, id.replace('bug_bot_select_', ''));
   }
 }
 
-async function handleNewSeveritySelected(interaction) {
+async function handleNewBotSelected(interaction) {
   const userId = interaction.user.id;
   const pending = getPending(userId);
   if (!pending) {
     return safeReply(interaction, { content: 'ข้อมูลรายงานหมดอายุ กรุณาเริ่มใหม่', ephemeral: true });
   }
 
-  // final race-condition guard before creating the ticket
+  // กันเคสสุดท้ายก่อนสร้าง ticket จริง เผื่อมีอะไรเปลี่ยนระหว่างที่เลือกบอทอยู่
   if (isBlacklisted(userId)) {
     clearPending(userId);
-    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การรายงานBug', ephemeral: true });
+    return safeReply(interaction, { content: '🚫 คุณถูกระงับสิทธิ์การแจ้งบั๊ก', ephemeral: true });
   }
   if (getUserActiveBug(userId)) {
     clearPending(userId);
     return safeReply(interaction, { content: 'คุณมี Ticket ที่ยังเปิดอยู่แล้ว', ephemeral: true });
   }
 
-  const severity = interaction.values[0];
+  const targetBot = interaction.values[0];
   await interaction.deferUpdate().catch(() => {});
   clearPending(userId);
 
@@ -1069,34 +1001,28 @@ async function handleNewSeveritySelected(interaction) {
       reporterId: userId,
       title: pending.title,
       description: pending.description,
-      severity,
+      targetBot,
       status: 'open',
       createdAt: Date.now(),
       fixedAt: null,
       channelId: null,
-      ticketMessageId: null,
-      escalated: false,
-      criticalSince: severity === 'critical' ? Date.now() : null,
     };
     data.bugs[bugId] = bug;
     data.activeTickets[userId] = bugId;
+    recordReportAttempt(userId);
     saveData();
   });
 
   try {
     const channel = await createTicketChannel(guild, bug);
     bug.channelId = channel.id;
-
-    const ticketMsg = await channel.send({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
-    bug.ticketMessageId = ticketMsg.id;
     saveData();
 
-    if (severity === 'critical') {
-      await sendCriticalAlert(bug);
-    }
+    await channel.send({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
+    await sendNewTicketLog(bug);
 
     await safeReply(interaction, {
-      content: `✅ สร้างรายงานBug **${bug.id}** เรียบร้อยแล้ว: <#${channel.id}>`,
+      content: `✅ สร้างรายงานบั๊ก **${bug.id}** เรียบร้อยแล้ว: <#${channel.id}>`,
       embeds: [],
       components: [],
     });
@@ -1104,16 +1030,13 @@ async function handleNewSeveritySelected(interaction) {
     console.error('[ticket] failed to create channel:', err.message);
     delete data.activeTickets[userId];
     saveData();
-    await safeReply(interaction, { content: '⚠️ ไม่สามารถสร้าง Ticket ได้ กรุณาแจ้งหัวดิส', components: [], embeds: [] });
+    await safeReply(interaction, { content: '⚠️ ไม่สามารถสร้าง Ticket ได้ กรุณาแจ้งแอดมิน', components: [], embeds: [] });
   }
 }
 
 async function handleStatusSelected(interaction, bugId) {
   const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
-  if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนสถานะ', ephemeral: true });
-  }
   const newStatus = interaction.values[0];
   await interaction.deferUpdate().catch(() => {});
   const channel = interaction.channel;
@@ -1123,16 +1046,13 @@ async function handleStatusSelected(interaction, bugId) {
   }
 }
 
-async function handleSeveritySelected(interaction, bugId) {
+async function handleBotSelected(interaction, bugId) {
   const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
-  if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนความรุนแรง', ephemeral: true });
-  }
-  const newSeverity = interaction.values[0];
+  const newBot = interaction.values[0];
   await interaction.deferUpdate().catch(() => {});
   const channel = interaction.channel;
-  await applySeverityChange(bug, newSeverity, channel);
+  await applyBotChange(bug, newBot, channel);
 }
 
 /* -------------------- State transitions -------------------- */
@@ -1157,50 +1077,29 @@ async function applyStatusChange(bug, newStatus, channel) {
   saveData();
 
   if (channel) {
-    await sendTicketUpdate(channel, 'BUG UPDATE', bug.id, statusText(oldStatus), statusText(newStatus));
+    await sendTicketUpdate(channel, '🔄 อัปเดตสถานะบั๊ก', bug.id, statusText(oldStatus), statusText(newStatus));
     await refreshTicketEmbed(channel, bug);
   }
 }
 
-async function applySeverityChange(bug, newSeverity, channel) {
-  const oldSeverity = bug.severity;
-  if (oldSeverity === newSeverity) return;
-  bug.severity = newSeverity;
-  if (newSeverity === 'critical') {
-    bug.escalated = false;
-    bug.criticalSince = Date.now();
-  } else {
-    bug.criticalSince = null;
-    bug.escalated = false;
-  }
+async function applyBotChange(bug, newBot, channel) {
+  const oldBot = bug.targetBot;
+  if (oldBot === newBot) return;
+  bug.targetBot = newBot;
   saveData();
 
   if (channel) {
-    await sendTicketUpdate(channel, 'SEVERS UPDATE', bug.id, sevText(oldSeverity), sevText(newSeverity));
+    await sendTicketUpdate(channel, '🤖 เปลี่ยนบอทที่แจ้ง', bug.id, oldBot || '-', newBot);
     await refreshTicketEmbed(channel, bug);
-  }
-  if (newSeverity === 'critical') {
-    await sendCriticalAlert(bug);
   }
 }
 
 async function refreshTicketEmbed(channel, bug) {
   try {
-    let botMsg = null;
-    if (bug.ticketMessageId) {
-      botMsg = await channel.messages.fetch(bug.ticketMessageId).catch(() => null);
-    }
-    if (!botMsg) {
-      // fallback for older tickets created before ticketMessageId was tracked
-      const messages = await channel.messages.fetch({ limit: 20 });
-      botMsg = messages.find(
-        (m) => m.author.id === client.user.id && m.embeds[0] && m.embeds[0].title === `🐛 ${bug.id}`
-      );
-      if (botMsg) {
-        bug.ticketMessageId = botMsg.id;
-        saveData();
-      }
-    }
+    const messages = await channel.messages.fetch({ limit: 20 });
+    const botMsg = messages.find(
+      (m) => m.author.id === client.user.id && m.embeds[0] && m.embeds[0].title === `🐛 ${bug.id}`
+    );
     if (botMsg) {
       await botMsg.edit({ embeds: [buildTicketEmbed(bug)], components: [buildTicketRow()] });
     }
@@ -1241,40 +1140,6 @@ function getBugIdFromChannel(channelId) {
   }
   return null;
 }
-
-/* ============================================================
-   MINI HTTP SERVER
-   ------------------------------------------------------------
-   Render's free tier only supports "Web Service" instances, which
-   require the process to bind to $PORT and respond to HTTP
-   requests (used for Render's own health checks). A plain
-   background worker isn't available on the free plan, so this
-   tiny server exists purely to satisfy that requirement - it has
-   nothing to do with the bot's actual functionality.
-
-   Note: Render's free web services spin down after ~15 minutes
-   of no incoming HTTP traffic and cold-start on the next request,
-   which will disconnect the Discord bot in between. If you need
-   the bot online 24/7, either upgrade to a paid Render instance
-   type, or set up an external uptime pinger (e.g. UptimeRobot,
-   cron-job.org) to hit this server's URL every 5-10 minutes.
-   ============================================================ */
-
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(
-      client.isReady()
-        ? `OK - logged in as ${client.user.tag}`
-        : 'OK - bot is starting...'
-    );
-  })
-  .listen(PORT, () => {
-    console.log(`[http] health check server listening on port ${PORT}`);
-  });
 
 /* ============================================================
    SAFETY NETS
