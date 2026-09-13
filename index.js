@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const {
   Client,
   GatewayIntentBits,
@@ -23,6 +24,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
+  ChannelSelectMenuBuilder,
   SlashCommandBuilder,
   Routes,
   REST,
@@ -35,15 +37,14 @@ const {
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID || null;
 const GUILD_ID = process.env.GUILD_ID || null;
-// TICKET_CATEGORY_ID / LOG_CHANNEL_ID / ANNOUNCE_CHANNEL_ID / ADMIN_ROLE_ID / DEVELOPER_ROLE_ID
-// ตั้งค่าตอนรันไทม์ผ่านคำสั่ง /bug config ต่าง ๆ แล้วเก็บลง data.json (data.config)
 
 const COOLDOWN = 5 * 60 * 1000;                // กันสแปม 5 นาทีต่อคน
 const RATE_LIMIT = 3;                          // แจ้งได้ 3 ครั้ง
 const RATE_WINDOW = 10 * 60 * 1000;            // ต่อ 10 นาที
 const DUPLICATE_THRESHOLD = 0.5;               // jaccard similarity เอาไว้เช็คบั๊กซ้ำ
-const PENDING_TTL = 10 * 60 * 1000;            // เก็บรายงานที่ค้าง (ยังไม่เลือกบอท) ไว้ในแรมแค่ 10 นาที
+const PENDING_TTL = 10 * 60 * 1000;            // อายุของข้อมูลที่ค้างอยู่ในแรม (รายงานที่ยังไม่เลือกบอท / draft panel)
 const MAX_BOT_LIST = 25;                       // Discord select menu จำกัด option ไว้ที่ 25 ตัว
+const DEFAULT_EMBED_COLOR = 0x5865f2;
 
 const DATA_FILE = path.join(__dirname, 'data.json');
 
@@ -60,7 +61,6 @@ const DEFAULT_DATA = {
   rateLimits: {},      // userId -> [timestamps]
   config: {
     logChannelId: null,
-    announceChannelId: null,
     adminRoleId: null,
     developerRoleId: null,
     ticketCategoryId: null,
@@ -77,11 +77,11 @@ function loadData() {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     const merged = Object.assign(JSON.parse(JSON.stringify(DEFAULT_DATA)), parsed);
-    // แก้บั๊ก: เดิม merge แบบตื้น (shallow) ทำให้ถ้า data.json เก่าไม่มีคีย์ใหม่ใน config
-    // (เช่น bots ที่เพิ่งเพิ่มเข้ามา) ค่าเริ่มต้นของ config จะหายไปทั้งก้อนเพราะโดน parsed.config ทับ
-    // เลย merge config แยกอีกชั้นเพื่อไม่ให้ค่า default ของฟิลด์ใหม่ ๆ หายไป
+    // merge config แยกอีกชั้น ไม่งั้นถ้า data.json เก่าไม่มีคีย์ใหม่ ค่า default ของ config จะหายไปทั้งก้อน
     merged.config = Object.assign(JSON.parse(JSON.stringify(DEFAULT_DATA.config)), parsed.config || {});
     if (!Array.isArray(merged.config.bots)) merged.config.bots = [];
+    // เผื่อ data.json เก่าเก็บลิสต์บอทเป็น string ธรรมดา (ก่อนเปลี่ยนมาใช้ user picker) กรองทิ้งกันพัง
+    merged.config.bots = merged.config.bots.filter((b) => b && typeof b === 'object' && typeof b.id === 'string');
     return merged;
   } catch (err) {
     console.error('[storage] failed to load data.json, using defaults:', err.message);
@@ -113,31 +113,12 @@ function withLock(fn) {
 }
 
 /* ============================================================
-   CONSTANTS / MAPS
-   ============================================================ */
-
-const STATUS = {
-  open: { emoji: '🟡', label: 'เปิดรับแจ้ง' },
-  investigating: { emoji: '🔵', label: 'กำลังตรวจสอบ' },
-  in_progress: { emoji: '🟠', label: 'กำลังแก้ไข' },
-  fixed: { emoji: '🟢', label: 'แก้ไขแล้ว' },
-  closed: { emoji: '⚫', label: 'ปิดแล้ว' },
-  rejected: { emoji: '🔴', label: 'ไม่รับแก้' },
-};
-
-const RESOLVED_STATUSES = ['fixed'];
-const TERMINAL_STATUSES = ['fixed', 'closed', 'rejected'];
-
-function statusText(key) {
-  const s = STATUS[key] || STATUS.open;
-  return `${s.emoji} ${s.label}`;
-}
-
-/* ============================================================
-   รายงานที่ยังค้างอยู่ (มีหัวข้อ/รายละเอียดแล้ว แต่ยังไม่ได้เลือกบอท)
+   รายงานที่ยังค้างอยู่ / draft ของ panel ที่ยังแต่งไม่เสร็จ
+   เก็บในแรมพอ ไม่จำเป็นต้องลง data.json เพราะเป็นของชั่วคราว
    ============================================================ */
 
 const pendingReports = new Map(); // userId -> { title, description, expiresAt }
+const pendingPanels = new Map();  // userId -> { title, description, image, footer, color, colorRaw, expiresAt }
 
 function setPending(userId, payload) {
   pendingReports.set(userId, { ...payload, expiresAt: Date.now() + PENDING_TTL });
@@ -154,10 +135,30 @@ function getPending(userId) {
 function clearPending(userId) {
   pendingReports.delete(userId);
 }
+
+function setPanelDraft(userId, draft) {
+  pendingPanels.set(userId, { ...draft, expiresAt: Date.now() + PENDING_TTL });
+}
+function getPanelDraft(userId) {
+  const d = pendingPanels.get(userId);
+  if (!d) return null;
+  if (Date.now() > d.expiresAt) {
+    pendingPanels.delete(userId);
+    return null;
+  }
+  return d;
+}
+function clearPanelDraft(userId) {
+  pendingPanels.delete(userId);
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [uid, p] of pendingReports.entries()) {
     if (now > p.expiresAt) pendingReports.delete(uid);
+  }
+  for (const [uid, d] of pendingPanels.entries()) {
+    if (now > d.expiresAt) pendingPanels.delete(uid);
   }
 }, 60 * 1000).unref();
 
@@ -269,6 +270,15 @@ async function safeReply(interaction, options) {
   }
 }
 
+function parseColor(input) {
+  if (!input) return DEFAULT_EMBED_COLOR;
+  const hex = input.trim().replace(/^#/, '');
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+    return parseInt(hex, 16);
+  }
+  return DEFAULT_EMBED_COLOR;
+}
+
 /* ============================================================
    รายชื่อบอทที่แอดมินตั้งไว้ให้เลือกตอนแจ้งบั๊ก
    ============================================================ */
@@ -277,26 +287,24 @@ function getBotList() {
   return Array.isArray(data.config.bots) ? data.config.bots : [];
 }
 
-function addBotToList(name) {
-  const trimmed = (name || '').trim();
-  if (!trimmed) return { ok: false, reason: 'empty' };
+function addBotToList(user) {
+  if (!user.bot) return { ok: false, reason: 'not_bot' };
   const list = getBotList();
-  if (list.some((b) => b.toLowerCase() === trimmed.toLowerCase())) {
+  if (list.some((b) => b.id === user.id)) {
     return { ok: false, reason: 'duplicate' };
   }
   if (list.length >= MAX_BOT_LIST) {
     return { ok: false, reason: 'full' };
   }
-  list.push(trimmed);
+  list.push({ id: user.id, name: user.username });
   data.config.bots = list;
   saveData();
   return { ok: true };
 }
 
-function removeBotFromList(name) {
-  const trimmed = (name || '').trim().toLowerCase();
+function removeBotFromList(userId) {
   const list = getBotList();
-  const next = list.filter((b) => b.toLowerCase() !== trimmed);
+  const next = list.filter((b) => b.id !== userId);
   if (next.length === list.length) return { ok: false };
   data.config.bots = next;
   saveData();
@@ -306,13 +314,6 @@ function removeBotFromList(name) {
 /* ============================================================
    EMBED BUILDERS
    ============================================================ */
-
-function buildPanelEmbed() {
-  return new EmbedBuilder()
-    .setTitle('ระบบแจ้งบั๊ก')
-    .setDescription('กดปุ่มด้านล่างเพื่อแจ้งบั๊กที่เจอ ( กดเล่น ๆ เดี๋ยวโดนแบล็คลิสต์ )')
-    .setColor(0x5865f2);
-}
 
 function buildPanelRow() {
   return new ActionRowBuilder().addComponents(
@@ -324,33 +325,86 @@ function buildPanelRow() {
   );
 }
 
-function computeResolutionMs(bug) {
-  const end = bug.fixedAt || Date.now();
-  return end - bug.createdAt;
+function buildPanelPreviewEmbed(draft) {
+  const embed = new EmbedBuilder()
+    .setTitle(draft.title)
+    .setDescription(draft.description)
+    .setColor(draft.color);
+  if (draft.image) embed.setImage(draft.image);
+  if (draft.footer) embed.setFooter({ text: draft.footer });
+  return embed;
+}
+
+function buildPanelModal(draft) {
+  const modal = new ModalBuilder().setCustomId('bug_panel_modal').setTitle('ตกแต่ง Panel แจ้งบั๊ก');
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId('panel_title')
+    .setLabel('หัวข้อ (Title)')
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(256)
+    .setRequired(true);
+  if (draft && draft.title) titleInput.setValue(draft.title);
+
+  const descInput = new TextInputBuilder()
+    .setCustomId('panel_description')
+    .setLabel('รายละเอียด (Description)')
+    .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(2000)
+    .setRequired(true);
+  if (draft && draft.description) descInput.setValue(draft.description);
+
+  const imageInput = new TextInputBuilder()
+    .setCustomId('panel_image')
+    .setLabel('ลิงก์รูปภาพ (เว้นว่างได้)')
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(300)
+    .setRequired(false);
+  if (draft && draft.image) imageInput.setValue(draft.image);
+
+  const footerInput = new TextInputBuilder()
+    .setCustomId('panel_footer')
+    .setLabel('ข้อความท้าย Embed (เว้นว่างได้)')
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(200)
+    .setRequired(false);
+  if (draft && draft.footer) footerInput.setValue(draft.footer);
+
+  const colorInput = new TextInputBuilder()
+    .setCustomId('panel_color')
+    .setLabel('สีขอบ Embed เช่น #5865F2 (เว้นว่างได้)')
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(7)
+    .setRequired(false);
+  if (draft && draft.colorRaw) colorInput.setValue(draft.colorRaw);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(titleInput),
+    new ActionRowBuilder().addComponents(descInput),
+    new ActionRowBuilder().addComponents(imageInput),
+    new ActionRowBuilder().addComponents(footerInput),
+    new ActionRowBuilder().addComponents(colorInput)
+  );
+  return modal;
 }
 
 function buildTicketEmbed(bug) {
-  const embed = new EmbedBuilder()
+  return new EmbedBuilder()
     .setTitle(`🐛 ${bug.id}`)
     .addFields(
       { name: '👤 ผู้แจ้ง', value: `<@${bug.reporterId}>`, inline: false },
       { name: '📝 หัวข้อ', value: bug.title.slice(0, 1024), inline: false },
       { name: '📄 รายละเอียด', value: bug.description.slice(0, 1024), inline: false },
-      { name: '🤖 บอทที่แจ้ง', value: bug.targetBot || '-', inline: true },
-      { name: '🔄 สถานะ', value: statusText(bug.status), inline: true },
-      { name: '⏱️ ระยะเวลาแก้ไข', value: formatDuration(computeResolutionMs(bug)), inline: true }
+      { name: '🤖 บอทที่แจ้ง', value: bug.targetBot ? `<@${bug.targetBot}>` : '-', inline: true }
     )
-    .setColor(0x5865f2)
+    .setColor(DEFAULT_EMBED_COLOR)
     .setFooter({ text: `แจ้งเมื่อ ${new Date(bug.createdAt).toLocaleString('th-TH')}` });
-  return embed;
 }
 
 function buildTicketRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('bug_status_btn').setLabel('สถานะ').setEmoji('🔄').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('bug_bot_btn').setLabel('เปลี่ยนบอท').setEmoji('🤖').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('bug_resolve_btn').setLabel('แก้ไขแล้ว').setEmoji('📢').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('bug_close_btn').setLabel('ปิด').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId('bug_close_btn').setLabel('ปิด (ลบ)').setEmoji('🗑️').setStyle(ButtonStyle.Danger)
   );
 }
 
@@ -372,7 +426,7 @@ const commands = [
     .setName('bug')
     .setDescription('จัดการระบบแจ้งบั๊ก')
     .addSubcommand((sub) =>
-      sub.setName('panel').setDescription('โพสต์แผงปุ่มแจ้งบั๊กในห้องนี้')
+      sub.setName('panel').setDescription('ตกแต่งและโพสต์แผงปุ่มแจ้งบั๊ก')
     )
     .addSubcommand((sub) =>
       sub
@@ -394,18 +448,6 @@ const commands = [
           opt
             .setName('channel')
             .setDescription('ห้อง log')
-            .addChannelTypes(ChannelType.GuildText)
-            .setRequired(true)
-        )
-    )
-    .addSubcommand((sub) =>
-      sub
-        .setName('set-announce-channel')
-        .setDescription('ตั้งห้องสำหรับประกาศบั๊กที่แก้เสร็จแล้ว')
-        .addChannelOption((opt) =>
-          opt
-            .setName('channel')
-            .setDescription('ห้องประกาศ')
             .addChannelTypes(ChannelType.GuildText)
             .setRequired(true)
         )
@@ -441,14 +483,14 @@ const commands = [
         .addSubcommand((sub) =>
           sub
             .setName('add')
-            .setDescription('เพิ่มชื่อบอทเข้าลิสต์ให้เลือก')
-            .addStringOption((opt) => opt.setName('name').setDescription('ชื่อบอท').setRequired(true))
+            .setDescription('เพิ่มบอทเข้าลิสต์ให้เลือก')
+            .addUserOption((opt) => opt.setName('user').setDescription('บอทที่จะเพิ่มเข้าลิสต์').setRequired(true))
         )
         .addSubcommand((sub) =>
           sub
             .setName('remove')
-            .setDescription('เอาชื่อบอทออกจากลิสต์')
-            .addStringOption((opt) => opt.setName('name').setDescription('ชื่อบอท').setRequired(true))
+            .setDescription('เอาบอทออกจากลิสต์')
+            .addUserOption((opt) => opt.setName('user').setDescription('บอทที่จะเอาออกจากลิสต์').setRequired(true))
         )
         .addSubcommand((sub) =>
           sub.setName('list').setDescription('ดูรายชื่อบอททั้งหมดในลิสต์ตอนนี้')
@@ -505,32 +547,13 @@ async function sendNewTicketLog(bug) {
       .setTitle('🆕 มีการแจ้งบั๊กใหม่')
       .setDescription(`${bug.id}\n${bug.title.slice(0, 1024)}`)
       .addFields(
-        { name: 'บอท', value: bug.targetBot || '-', inline: true },
+        { name: 'บอท', value: bug.targetBot ? `<@${bug.targetBot}>` : '-', inline: true },
         { name: 'ผู้แจ้ง', value: `<@${bug.reporterId}>`, inline: true }
       )
-      .setColor(0x5865f2);
+      .setColor(DEFAULT_EMBED_COLOR);
     await channel.send({ content: bug.channelId ? `<#${bug.channelId}>` : undefined, embeds: [embed] });
   } catch (err) {
     console.error('[log] failed to send new ticket log:', err.message);
-  }
-}
-
-async function sendResolvedAnnouncement(bug) {
-  if (!data.config.announceChannelId) return;
-  try {
-    const channel = await client.channels.fetch(data.config.announceChannelId).catch(() => null);
-    if (!channel) return;
-    const embed = new EmbedBuilder()
-      .setTitle('✅ แก้บั๊กเรียบร้อยแล้ว')
-      .setDescription(`${bug.id}\nปัญหา: ${bug.title.slice(0, 1024)}`)
-      .addFields(
-        { name: 'บอท', value: bug.targetBot || '-', inline: true },
-        { name: 'สถานะ', value: statusText(bug.status), inline: true }
-      )
-      .setColor(0x57f287);
-    await channel.send({ embeds: [embed] });
-  } catch (err) {
-    console.error('[announcement] failed to send:', err.message);
   }
 }
 
@@ -598,6 +621,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await handleButton(interaction);
     } else if (interaction.isModalSubmit()) {
       await handleModalSubmit(interaction);
+    } else if (interaction.isChannelSelectMenu()) {
+      await handlePanelChannelSelected(interaction);
     } else if (interaction.isStringSelectMenu()) {
       await handleSelectMenu(interaction);
     }
@@ -623,8 +648,8 @@ async function handleSlashCommand(interaction) {
     if (!isAdmin(interaction.member)) {
       return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
     }
-    await interaction.reply({ embeds: [buildPanelEmbed()], components: [buildPanelRow()] });
-    return;
+    const existingDraft = getPanelDraft(interaction.user.id);
+    return interaction.showModal(buildPanelModal(existingDraft));
   }
 
   if (sub === 'blacklist' || sub === 'unblacklist') {
@@ -651,16 +676,6 @@ async function handleSlashCommand(interaction) {
     data.config.logChannelId = channel.id;
     saveData();
     return safeReply(interaction, { content: `✅ ตั้งค่าห้อง Log เป็น <#${channel.id}> แล้ว`, ephemeral: true });
-  }
-
-  if (sub === 'set-announce-channel') {
-    if (!isAdmin(interaction.member)) {
-      return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
-    }
-    const channel = interaction.options.getChannel('channel', true);
-    data.config.announceChannelId = channel.id;
-    saveData();
-    return safeReply(interaction, { content: `✅ ตั้งค่าห้องประกาศเป็น <#${channel.id}> แล้ว`, ephemeral: true });
   }
 
   if (sub === 'set-admin-role') {
@@ -700,33 +715,34 @@ async function handleBotListCommand(interaction, sub) {
   }
 
   if (sub === 'add') {
-    const name = interaction.options.getString('name', true);
-    const result = addBotToList(name);
+    const user = interaction.options.getUser('user', true);
+    const result = addBotToList(user);
     if (!result.ok) {
       const msg =
-        result.reason === 'duplicate' ? '⚠️ มีชื่อนี้อยู่ในลิสต์อยู่แล้ว' :
+        result.reason === 'not_bot' ? '⚠️ ต้องเลือกบัญชีที่เป็นบอทเท่านั้นนะ' :
+        result.reason === 'duplicate' ? '⚠️ มีบอทนี้อยู่ในลิสต์อยู่แล้ว' :
         result.reason === 'full' ? `⚠️ ลิสต์เต็มแล้ว (สูงสุด ${MAX_BOT_LIST} รายการ)` :
-        '⚠️ กรุณาระบุชื่อบอทด้วย';
+        '⚠️ เกิดข้อผิดพลาด';
       return safeReply(interaction, { content: msg, ephemeral: true });
     }
-    return safeReply(interaction, { content: `✅ เพิ่ม **${name.trim()}** เข้าลิสต์ให้เลือกตอนแจ้งบั๊กแล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ เพิ่ม <@${user.id}> เข้าลิสต์ให้เลือกตอนแจ้งบั๊กแล้ว`, ephemeral: true });
   }
 
   if (sub === 'remove') {
-    const name = interaction.options.getString('name', true);
-    const result = removeBotFromList(name);
+    const user = interaction.options.getUser('user', true);
+    const result = removeBotFromList(user.id);
     if (!result.ok) {
-      return safeReply(interaction, { content: '⚠️ ไม่พบชื่อนี้ในลิสต์', ephemeral: true });
+      return safeReply(interaction, { content: '⚠️ ไม่พบบอทนี้ในลิสต์', ephemeral: true });
     }
-    return safeReply(interaction, { content: `✅ เอา **${name.trim()}** ออกจากลิสต์แล้ว`, ephemeral: true });
+    return safeReply(interaction, { content: `✅ เอา <@${user.id}> ออกจากลิสต์แล้ว`, ephemeral: true });
   }
 
   if (sub === 'list') {
     const list = getBotList();
     if (list.length === 0) {
-      return safeReply(interaction, { content: 'ตอนนี้ยังไม่มีชื่อบอทในลิสต์เลย ใช้ `/bug bot add` เพื่อเพิ่มก่อนนะ', ephemeral: true });
+      return safeReply(interaction, { content: 'ตอนนี้ยังไม่มีบอทในลิสต์เลย ใช้ `/bug bot add` เพื่อเพิ่มก่อนนะ', ephemeral: true });
     }
-    const listText = list.map((b, i) => `${i + 1}. ${b}`).join('\n');
+    const listText = list.map((b, i) => `${i + 1}. <@${b.id}>`).join('\n');
     return safeReply(interaction, { content: `📋 รายชื่อบอทที่แจ้งบั๊กได้ตอนนี้:\n${listText}`, ephemeral: true });
   }
 }
@@ -738,10 +754,11 @@ async function handleButton(interaction) {
 
   if (id === 'bug_report_btn') return handleReportButton(interaction);
   if (id === 'bug_report_new_anyway') return handleCreateNewAnyway(interaction);
-  if (id === 'bug_status_btn') return handleStatusButton(interaction);
   if (id === 'bug_bot_btn') return handleBotButton(interaction);
-  if (id === 'bug_resolve_btn') return handleResolveButton(interaction);
   if (id === 'bug_close_btn') return handleCloseButton(interaction);
+  if (id === 'bug_panel_confirm') return handlePanelConfirm(interaction);
+  if (id === 'bug_panel_edit') return handlePanelEdit(interaction);
+  if (id === 'bug_panel_cancel') return handlePanelCancel(interaction);
 }
 
 async function handleReportButton(interaction) {
@@ -804,26 +821,6 @@ async function handleCreateNewAnyway(interaction) {
   await presentBotSelect(interaction, pending);
 }
 
-async function handleStatusButton(interaction) {
-  const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
-  if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
-  if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์เปลี่ยนสถานะ', ephemeral: true });
-  }
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`bug_status_select_${bug.id}`)
-    .setPlaceholder('เลือกสถานะใหม่')
-    .addOptions(
-      Object.entries(STATUS).map(([key, val]) => ({
-        label: val.label,
-        value: key,
-        emoji: val.emoji,
-        default: key === bug.status,
-      }))
-    );
-  await safeReply(interaction, { components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true, content: `เปลี่ยนสถานะของ ${bug.id}` });
-}
-
 async function handleBotButton(interaction) {
   const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
@@ -838,41 +835,34 @@ async function handleBotButton(interaction) {
     .setCustomId(`bug_bot_select_${bug.id}`)
     .setPlaceholder('เลือกบอทใหม่')
     .addOptions(
-      list.slice(0, MAX_BOT_LIST).map((name) => ({
-        label: name.slice(0, 100),
-        value: name,
-        default: name === bug.targetBot,
+      list.slice(0, MAX_BOT_LIST).map((b) => ({
+        label: b.name.slice(0, 100),
+        value: b.id,
+        default: b.id === bug.targetBot,
       }))
     );
   await safeReply(interaction, { components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true, content: `เปลี่ยนบอทที่แจ้งของ ${bug.id}` });
 }
 
-async function handleResolveButton(interaction) {
-  const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
-  if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
-  if (!isAdmin(interaction.member)) {
-    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์กดแก้ไขแล้ว', ephemeral: true });
-  }
-  await interaction.deferUpdate().catch(() => {});
-  await applyStatusChange(bug, 'fixed', interaction.channel);
-  await sendResolvedAnnouncement(bug);
-}
-
 async function handleCloseButton(interaction) {
-  const bug = data.bugs[getBugIdFromChannel(interaction.channelId)];
+  const bugId = getBugIdFromChannel(interaction.channelId);
+  const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบข้อมูล Bug ของ Ticket นี้', ephemeral: true });
   if (!isAdmin(interaction.member)) {
     return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ปิด Ticket', ephemeral: true });
   }
-  await interaction.deferReply({ ephemeral: true }).catch(() => {});
-  await archiveTicket(bug, interaction.channel);
-  await safeReply(interaction, { content: `🔒 ปิด Ticket ${bug.id} เรียบร้อยแล้ว` });
+  await safeReply(interaction, { content: `🗑️ กำลังลบ Ticket ${bug.id}...` });
+  await deleteTicket(bug, interaction.channel);
 }
 
 /* -------------------- Modal submit -------------------- */
 
 async function handleModalSubmit(interaction) {
-  if (interaction.customId !== 'bug_report_modal') return;
+  if (interaction.customId === 'bug_report_modal') return handleReportModalSubmit(interaction);
+  if (interaction.customId === 'bug_panel_modal') return handlePanelModalSubmit(interaction);
+}
+
+async function handleReportModalSubmit(interaction) {
   const userId = interaction.user.id;
 
   // เช็คซ้ำอีกรอบเผื่อมีอะไรเปลี่ยนไประหว่างกดปุ่มกับตอนกด submit modal
@@ -926,6 +916,48 @@ async function handleModalSubmit(interaction) {
   await presentBotSelect(interaction, { title, description });
 }
 
+async function handlePanelModalSubmit(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return safeReply(interaction, { content: '❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้', ephemeral: true });
+  }
+
+  const title = interaction.fields.getTextInputValue('panel_title').trim();
+  const description = interaction.fields.getTextInputValue('panel_description').trim();
+  const image = interaction.fields.getTextInputValue('panel_image').trim();
+  const footer = interaction.fields.getTextInputValue('panel_footer').trim();
+  const colorRaw = interaction.fields.getTextInputValue('panel_color').trim();
+
+  if (!title || !description) {
+    return safeReply(interaction, { content: '⚠️ กรุณากรอกหัวข้อและรายละเอียดด้วย', ephemeral: true });
+  }
+
+  const validImage = /^https?:\/\//i.test(image) ? image : null;
+  const color = parseColor(colorRaw);
+
+  const draft = {
+    title,
+    description,
+    image: validImage,
+    footer: footer || null,
+    color,
+    colorRaw: colorRaw || null,
+  };
+  setPanelDraft(interaction.user.id, draft);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('bug_panel_confirm').setLabel('ยืนยัน').setEmoji('✅').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('bug_panel_edit').setLabel('แก้ไข').setEmoji('✏️').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('bug_panel_cancel').setLabel('ยกเลิก').setEmoji('🗑️').setStyle(ButtonStyle.Danger)
+  );
+
+  await safeReply(interaction, {
+    content: 'นี่คือตัวอย่าง Panel ที่จะโพสต์ ลองดูก่อนแล้วค่อยเลือกว่าจะยืนยัน / แก้ไข / ยกเลิก',
+    embeds: [buildPanelPreviewEmbed(draft)],
+    components: [row],
+    ephemeral: true,
+  });
+}
+
 async function presentBotSelect(interaction, payload) {
   const list = getBotList();
   if (list.length === 0) {
@@ -941,13 +973,67 @@ async function presentBotSelect(interaction, payload) {
     .setCustomId('bug_new_bot_select')
     .setPlaceholder('เลือกบอทที่เจอบั๊ก')
     .addOptions(
-      list.slice(0, MAX_BOT_LIST).map((name) => ({ label: name.slice(0, 100), value: name }))
+      list.slice(0, MAX_BOT_LIST).map((b) => ({ label: b.name.slice(0, 100), value: b.id }))
     );
   await safeReply(interaction, {
     content: 'กรุณาเลือกว่าบั๊กนี้เจอในบอทตัวไหน',
     components: [new ActionRowBuilder().addComponents(menu)],
     ephemeral: true,
   });
+}
+
+/* -------------------- Panel flow (confirm / edit / cancel / ส่งไปห้องไหน) -------------------- */
+
+async function handlePanelConfirm(interaction) {
+  const draft = getPanelDraft(interaction.user.id);
+  if (!draft) {
+    return safeReply(interaction, { content: '⚠️ ข้อมูล Panel หมดอายุแล้ว กรุณาใช้ `/bug panel` ใหม่', embeds: [], components: [] });
+  }
+
+  const channelSelect = new ChannelSelectMenuBuilder()
+    .setCustomId('bug_panel_channel_select')
+    .setPlaceholder('เลือกห้องที่จะส่ง Panel นี้')
+    .addChannelTypes(ChannelType.GuildText);
+
+  await safeReply(interaction, {
+    content: 'จะส่ง Panel นี้ไว้ห้องไหน?',
+    embeds: [],
+    components: [new ActionRowBuilder().addComponents(channelSelect)],
+  });
+}
+
+async function handlePanelEdit(interaction) {
+  const draft = getPanelDraft(interaction.user.id);
+  await interaction.showModal(buildPanelModal(draft));
+}
+
+async function handlePanelCancel(interaction) {
+  clearPanelDraft(interaction.user.id);
+  await safeReply(interaction, { content: '🗑️ ยกเลิกการสร้าง Panel แล้ว', embeds: [], components: [] });
+}
+
+async function handlePanelChannelSelected(interaction) {
+  if (interaction.customId !== 'bug_panel_channel_select') return;
+
+  const draft = getPanelDraft(interaction.user.id);
+  if (!draft) {
+    return safeReply(interaction, { content: '⚠️ ข้อมูล Panel หมดอายุแล้ว กรุณาใช้ `/bug panel` ใหม่', embeds: [], components: [] });
+  }
+
+  const channel = interaction.channels.first();
+  if (!channel || !channel.isTextBased()) {
+    return safeReply(interaction, { content: '⚠️ เลือกห้องไม่ถูกต้อง ลองใหม่อีกครั้ง', components: [] });
+  }
+
+  clearPanelDraft(interaction.user.id);
+
+  try {
+    await channel.send({ embeds: [buildPanelPreviewEmbed(draft)], components: [buildPanelRow()] });
+    await safeReply(interaction, { content: `✅ โพสต์ Panel ไว้ที่ <#${channel.id}> เรียบร้อยแล้ว`, embeds: [], components: [] });
+  } catch (err) {
+    console.error('[panel] failed to send:', err.message);
+    await safeReply(interaction, { content: '⚠️ ส่ง Panel ไม่สำเร็จ เช็คสิทธิ์บอทในห้องนั้นด้วยนะ', embeds: [], components: [] });
+  }
 }
 
 /* -------------------- Select menus -------------------- */
@@ -957,9 +1043,6 @@ async function handleSelectMenu(interaction) {
 
   if (id === 'bug_new_bot_select') {
     return handleNewBotSelected(interaction);
-  }
-  if (id.startsWith('bug_status_select_')) {
-    return handleStatusSelected(interaction, id.replace('bug_status_select_', ''));
   }
   if (id.startsWith('bug_bot_select_')) {
     return handleBotSelected(interaction, id.replace('bug_bot_select_', ''));
@@ -1002,9 +1085,7 @@ async function handleNewBotSelected(interaction) {
       title: pending.title,
       description: pending.description,
       targetBot,
-      status: 'open',
       createdAt: Date.now(),
-      fixedAt: null,
       channelId: null,
     };
     data.bugs[bugId] = bug;
@@ -1034,18 +1115,6 @@ async function handleNewBotSelected(interaction) {
   }
 }
 
-async function handleStatusSelected(interaction, bugId) {
-  const bug = data.bugs[bugId];
-  if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
-  const newStatus = interaction.values[0];
-  await interaction.deferUpdate().catch(() => {});
-  const channel = interaction.channel;
-  await applyStatusChange(bug, newStatus, channel);
-  if (newStatus === 'fixed') {
-    await sendResolvedAnnouncement(bug);
-  }
-}
-
 async function handleBotSelected(interaction, bugId) {
   const bug = data.bugs[bugId];
   if (!bug) return safeReply(interaction, { content: '⚠️ ไม่พบ Bug นี้', ephemeral: true });
@@ -1057,31 +1126,6 @@ async function handleBotSelected(interaction, bugId) {
 
 /* -------------------- State transitions -------------------- */
 
-async function applyStatusChange(bug, newStatus, channel) {
-  const oldStatus = bug.status;
-  if (oldStatus === newStatus) return;
-  bug.status = newStatus;
-  if (RESOLVED_STATUSES.includes(newStatus) && !bug.fixedAt) {
-    bug.fixedAt = Date.now();
-  }
-  if (!RESOLVED_STATUSES.includes(newStatus)) {
-    bug.fixedAt = null;
-  }
-  if (TERMINAL_STATUSES.includes(newStatus)) {
-    if (data.activeTickets[bug.reporterId] === bug.id) {
-      delete data.activeTickets[bug.reporterId];
-    }
-  } else {
-    data.activeTickets[bug.reporterId] = bug.id;
-  }
-  saveData();
-
-  if (channel) {
-    await sendTicketUpdate(channel, '🔄 อัปเดตสถานะบั๊ก', bug.id, statusText(oldStatus), statusText(newStatus));
-    await refreshTicketEmbed(channel, bug);
-  }
-}
-
 async function applyBotChange(bug, newBot, channel) {
   const oldBot = bug.targetBot;
   if (oldBot === newBot) return;
@@ -1089,7 +1133,7 @@ async function applyBotChange(bug, newBot, channel) {
   saveData();
 
   if (channel) {
-    await sendTicketUpdate(channel, '🤖 เปลี่ยนบอทที่แจ้ง', bug.id, oldBot || '-', newBot);
+    await sendTicketUpdate(channel, '🤖 เปลี่ยนบอทที่แจ้ง', bug.id, oldBot ? `<@${oldBot}>` : '-', `<@${newBot}>`);
     await refreshTicketEmbed(channel, bug);
   }
 }
@@ -1108,26 +1152,18 @@ async function refreshTicketEmbed(channel, bug) {
   }
 }
 
-async function archiveTicket(bug, channel) {
-  if (!TERMINAL_STATUSES.includes(bug.status)) {
-    bug.status = 'closed';
-  }
+async function deleteTicket(bug, channel) {
   if (data.activeTickets[bug.reporterId] === bug.id) {
     delete data.activeTickets[bug.reporterId];
   }
-  bug.archived = true;
-  bug.archivedAt = Date.now();
+  delete data.bugs[bug.id];
   saveData();
 
   if (channel) {
     try {
-      await channel.permissionOverwrites.edit(bug.reporterId, { SendMessages: false });
-      if (!channel.name.startsWith('closed-')) {
-        await channel.setName(`closed-${bug.id}`.toLowerCase()).catch(() => {});
-      }
-      await channel.send({ content: `🔒 Ticket ${bug.id} ถูกปิดและเก็บเป็นข้อมูลถาวรแล้ว` });
+      await channel.delete(`ปิด Ticket ${bug.id}`);
     } catch (err) {
-      console.error('[archive] failed:', err.message);
+      console.error('[ticket] failed to delete channel:', err.message);
     }
   }
 }
@@ -1146,7 +1182,6 @@ function getBugIdFromChannel(channelId) {
    ถ้ารันเป็น Background Worker ไม่มี PORT ให้มา ก็แค่ข้ามส่วนนี้ไปเฉย ๆ
    ============================================================ */
 
-const http = require('http');
 const PORT = process.env.PORT;
 
 if (PORT) {
